@@ -1,4 +1,5 @@
 import { spawn } from 'child_process'
+import { cpus } from 'os'
 import { readFileSync, writeFileSync, appendFileSync, unlinkSync, existsSync } from 'fs'
 import { join } from 'path'
 import { app } from 'electron'
@@ -217,7 +218,7 @@ export async function exportVideo(
     try {
       let completed = 0
       const queue = clips.map((_, i) => i)
-      const workers = Array.from({ length: Math.min(4, clips.length) }, async () => {
+      const workers = Array.from({ length: Math.min(cpus().length, clips.length) }, async () => {
         while (queue.length > 0) {
           const i = queue.shift()!
           const clip = clips[i]
@@ -258,9 +259,11 @@ export async function exportVideo(
     return
   }
 
-  // Rotation path: re-encode clips with VideoToolbox (hardware) in parallel,
-  // then concat. Concurrency capped at 4 to avoid I/O contention.
-  const CONCURRENCY = 4
+  // Rotation path: re-encode all segments with hevc_videotoolbox so the final
+  // concat can use -c copy safely (consistent codec params). Pixel format is
+  // converted explicitly in the filtergraph to handle 10-bit source footage.
+  // Concurrency scales with CPU count.
+  const CONCURRENCY = cpus().length
   const tmpFiles: string[] = new Array(clips.length)
   let completed = 0
   try {
@@ -275,30 +278,28 @@ export async function exportVideo(
         '-i', clip.videoPath
       ]
 
-      if (clip.rotation !== 0) {
-        const vf = rotationFilter(clip.rotation)
-        try {
-          log(`[export] clip ${i}: VideoToolbox encode (rotation=${clip.rotation})`)
-          await runFFmpeg([
-            ...baseArgs,
-            '-vf', vf, '-metadata:s:v', 'rotate=0',
-            '-c:v', 'h264_videotoolbox', '-b:v', '8000k',
-            '-pix_fmt', 'yuv420p', '-c:a', 'aac',
-            '-y', tmpOut
-          ])
-          log(`[export] clip ${i}: VideoToolbox succeeded`)
-        } catch (e) {
-          log(`[export] clip ${i}: VideoToolbox failed (${e}), falling back to libx264`)
-          await runFFmpeg([
-            ...baseArgs,
-            '-vf', vf, '-metadata:s:v', 'rotate=0',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac',
-            '-y', tmpOut
-          ])
-        }
-      } else {
-        log(`[export] clip ${i}: stream copy (no rotation)`)
-        await runFFmpeg([...baseArgs, '-c', 'copy', '-y', tmpOut])
+      const rotation = clip.rotation !== 0 ? rotationFilter(clip.rotation) : null
+      const vf = rotation ? `${rotation},format=yuv420p` : 'format=yuv420p'
+      const metaArgs = rotation ? ['-metadata:s:v', 'rotate=0'] : []
+
+      try {
+        log(`[export] clip ${i}: VideoToolbox${rotation ? ` + rotate(${clip.rotation})` : ''}`)
+        await runFFmpeg([
+          ...baseArgs,
+          '-vf', vf, ...metaArgs,
+          '-c:v', 'hevc_videotoolbox', '-b:v', '20000k', '-tag:v', 'hvc1',
+          '-c:a', 'aac',
+          '-y', tmpOut
+        ])
+        log(`[export] clip ${i}: VideoToolbox succeeded`)
+      } catch (e) {
+        log(`[export] clip ${i}: VideoToolbox failed (${e}), falling back to libx265`)
+        await runFFmpeg([
+          ...baseArgs,
+          '-vf', vf, ...metaArgs,
+          '-c:v', 'libx265', '-preset', 'ultrafast', '-tag:v', 'hvc1', '-c:a', 'aac',
+          '-y', tmpOut
+        ])
       }
 
       completed++
@@ -318,12 +319,12 @@ export async function exportVideo(
 
     writeFileSync(concatList, tmpFiles.map((f) => `file '${f}'`).join('\n'))
 
+    // All segments share codec params — safe to stream copy
     await runFFmpegWithProgress(
       [
         '-f', 'concat', '-safe', '0',
         '-i', concatList,
         '-c', 'copy',
-        '-avoid_negative_ts', 'make_zero',
         '-progress', 'pipe:1',
         '-y', outputPath
       ],
